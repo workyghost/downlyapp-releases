@@ -1,0 +1,111 @@
+# workyghost/downlyapp-releases deposuna .github/workflows/publish-engine.yml olarak kopyalanir.
+# Kaynagi downlyapp deposunda tutuluyor ki surumlensin ve devir belgesinden bulunabilsin.
+name: Motor yayinla (imzali manifest)
+
+on:
+  schedule: [{ cron: '30 4 * * *' }]
+  workflow_dispatch:
+    inputs:
+      channel:
+        description: 'nightly | stable'
+        default: nightly
+
+permissions:
+  contents: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Kanali sec
+        id: ch
+        run: |
+          CH="${{ github.event.inputs.channel || 'nightly' }}"
+          echo "name=$CH" >> "$GITHUB_OUTPUT"
+          if [ "$CH" = "nightly" ]; then
+            echo "repo=yt-dlp/yt-dlp-nightly-builds" >> "$GITHUB_OUTPUT"
+            echo "enum=NIGHTLY" >> "$GITHUB_OUTPUT"
+          else
+            echo "repo=yt-dlp/yt-dlp" >> "$GITHUB_OUTPUT"
+            echo "enum=STABLE" >> "$GITHUB_OUTPUT"
+          fi
+
+      # Uygulamanin calistirdigi sey Python zipapp'i olan 'yt-dlp' varligi; kutuphanenin
+      # noBackupFilesDir/youtubedl-android/yt-dlp/yt-dlp dosyasina birebir bu iniyor.
+      - name: yt-dlp surumunu ve varligini al
+        id: dl
+        run: |
+          set -euo pipefail
+          API="https://api.github.com/repos/${{ steps.ch.outputs.repo }}/releases/latest"
+          TAG=$(curl -sSL -H 'Accept: application/vnd.github+json' "$API" | jq -r .tag_name)
+          [ -n "$TAG" ] && [ "$TAG" != "null" ]
+          curl -sSL -o yt-dlp "https://github.com/${{ steps.ch.outputs.repo }}/releases/download/$TAG/yt-dlp"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "sha=$(sha256sum yt-dlp | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+          echo "size=$(stat -c%s yt-dlp)" >> "$GITHUB_OUTPUT"
+
+      # KAPI: calismayan bir ikili manifeste GIRMEZ. TikTok/IG'ye CI'dan istek atmak guvenilir
+      # degil (bot filtresi, bolge kisiti) - bu yuzden agsiz kapilar kullaniliyor.
+      - name: Canary
+        run: |
+          set -euo pipefail
+          chmod +x yt-dlp
+          V=$(python3 yt-dlp --version)
+          echo "surum: $V"
+          [ "$V" = "${{ steps.dl.outputs.tag }}" ]
+          python3 yt-dlp --list-extractors > ext.txt
+          for E in TikTok Instagram; do
+            grep -qx "$E" ext.txt || { echo "cikarici yok: $E"; exit 1; }
+          done
+          grep -q '^youtube' ext.txt || { echo "youtube cikaricisi yok"; exit 1; }
+
+      - name: Binary'yi yayinla
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          TAG="engine-${{ steps.ch.outputs.name }}-${{ steps.dl.outputs.tag }}"
+          gh release view "$TAG" >/dev/null 2>&1 || gh release create "$TAG" --title "$TAG" --notes "yt-dlp ${{ steps.dl.outputs.tag }} (${{ steps.ch.outputs.name }})"
+          gh release upload "$TAG" yt-dlp --clobber
+          echo "URL=https://github.com/${{ github.repository }}/releases/download/$TAG/yt-dlp" >> "$GITHUB_ENV"
+
+      # Imza manifestin BAYTLARI uzerinde; govde base64 tasiniyor ki dogrulanan ile
+      # ayristirilan birebir ayni olsun (canonicalization sorunu dogmasin).
+      - name: Manifesti uret ve imzala
+        env:
+          ENGINE_SIGNING_KEY: ${{ secrets.ENGINE_SIGNING_KEY }}
+        run: |
+          set -euo pipefail
+          test -n "$ENGINE_SIGNING_KEY" || { echo "ENGINE_SIGNING_KEY sirri yok"; exit 1; }
+          mkdir -p engine
+          jq -nc \
+            --argjson schema 1 \
+            --arg channel "${{ steps.ch.outputs.enum }}" \
+            --arg version "${{ steps.dl.outputs.tag }}" \
+            --arg url "$URL" \
+            --argjson sizeBytes ${{ steps.dl.outputs.size }} \
+            --arg sha256 "${{ steps.dl.outputs.sha }}" \
+            --argjson publishedAt "$(date +%s)000" \
+            '{schema:$schema,channel:$channel,version:$version,url:$url,sizeBytes:$sizeBytes,sha256:$sha256,publishedAt:$publishedAt}' \
+            > manifest.json
+          printf '%s' "$ENGINE_SIGNING_KEY" > key.pem
+          openssl dgst -sha256 -sign key.pem -out sig.der manifest.json
+          jq -nc \
+            --arg keyId "downly-engine-2026-08" \
+            --arg payload "$(openssl base64 -A -in manifest.json)" \
+            --arg sig "$(openssl base64 -A -in sig.der)" \
+            '{keyId:$keyId,payload:$payload,sig:$sig}' \
+            > "engine/${{ steps.ch.outputs.name }}.json"
+          shred -u key.pem sig.der
+
+      - name: Manifesti depoya yaz
+        run: |
+          set -euo pipefail
+          git config user.name  'downly-bot'
+          git config user.email 'noreply@github.com'
+          git add "engine/${{ steps.ch.outputs.name }}.json"
+          if git diff --cached --quiet; then echo 'degisiklik yok'; exit 0; fi
+          git commit -m "engine(${{ steps.ch.outputs.name }}): ${{ steps.dl.outputs.tag }}"
+          git push
