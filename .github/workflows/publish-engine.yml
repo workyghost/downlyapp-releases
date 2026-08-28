@@ -67,7 +67,11 @@ jobs:
         run: |
           set -euo pipefail
           TAG="engine-${{ steps.ch.outputs.name }}-${{ steps.dl.outputs.tag }}"
-          gh release view "$TAG" >/dev/null 2>&1 || gh release create "$TAG" --title "$TAG" --notes "yt-dlp ${{ steps.dl.outputs.tag }} (${{ steps.ch.outputs.name }})"
+          # --prerelease SART: bu depo hem uygulama hem motor yayini tasiyor ve uygulama
+          # kendini /releases/latest ile yokluyor. Isaretsiz birakilirsa motor yayini
+          # "latest" olur, icinde .apk bulunmadigi icin guncelleyici sessizce
+          # "guncelsin" der. (Kaynak: downlyapp/tools/engine-release/publish-engine.yml)
+          gh release view "$TAG" >/dev/null 2>&1 || gh release create "$TAG" --title "$TAG" --notes "yt-dlp ${{ steps.dl.outputs.tag }} (${{ steps.ch.outputs.name }})" --prerelease
           gh release upload "$TAG" yt-dlp --clobber
           echo "URL=https://github.com/${{ github.repository }}/releases/download/$TAG/yt-dlp" >> "$GITHUB_ENV"
 
